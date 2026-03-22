@@ -1,0 +1,31 @@
+{
+  "title": "Darwin PBPK Platform - Julia Implementation",
+  "description": "Complete migration to Julia for Physiologically-Based Pharmacokinetic (PBPK) modeling with Graph Neural Networks. 100% Julia codebase with 4× performance improvement over Python implementation.",
+  "creators": [
+    {
+      "name": "Agourakis, Sounio",
+      "affiliation": "Independent Researcher"
+    }
+  ],
+  "keywords": [
+    "PBPK",
+    "Pharmacokinetics",
+    "Graph Neural Networks",
+    "Julia",
+    "Drug Discovery",
+    "Machine Learning",
+    "Scientific Computing"
+  ],
+  "license": {
+    "id": "MIT"
+  },
+  "version": "2.0.0-julia",
+  "upload_type": "software",
+  "publication_date": "2025-11-18",
+  "communities": [
+    {
+      "identifier": "pharmacokinetics"
+    }
+  ],
+  "notes": "BREAKING CHANGE: Complete migration from Python to Julia. Repository is now 100% Julia with 0% Python code. Requires Julia 1.9+."
+}
