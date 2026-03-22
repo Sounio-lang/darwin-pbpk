@@ -1,0 +1,519 @@
+// darwin_pbpk/epistemic_sim.sio — 4-Compartment Epistemic PBPK Simulation
+//
+// Self-contained 4-compartment oral PBPK model (gut, central, peripheral,
+// eliminated) with GUM uncertainty propagation via RK4 integration.
+//
+// Compartment ODE system:
+//   d(gut)/dt        = -ka * gut
+//   d(central)/dt    = ka * gut - (ke + k12) * central + k21 * peripheral
+//   d(peripheral)/dt = k12 * central - k21 * peripheral
+//   d(eliminated)/dt = ke * central
+//
+// Uncertainty propagated analytically via GUM linearization at each RK4 step.
+// AUC computed by trapezoidal rule; Cmax/Tmax tracked over integration window.
+//
+// Reference: JCGM 100:2008 (GUM), §13.3 — linearized uncertainty propagation.
+
+// ============================================================================
+// MATH HELPERS (self-contained)
+// ============================================================================
+
+fn sim_sqrt(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 }
+    var y = x
+    var i = 0
+    while i < 20 {
+        y = (y + x / y) * 0.5
+        i = i + 1
+    }
+    return y
+}
+
+fn sim_abs(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sim_max(a: f64, b: f64) -> f64 {
+    if a > b { return a }
+    return b
+}
+
+fn sim_min(a: f64, b: f64) -> f64 {
+    if a < b { return a }
+    return b
+}
+
+// ln(2) — used for half-life = ln(2)/ke
+fn ln2() -> f64 { 0.6931471805599453 }
+
+// ============================================================================
+// GUM BUILDING BLOCKS (inlined — no cross-module dependency required)
+// ============================================================================
+
+pub struct GUMResult {
+    pub value: f64,
+    pub std_uncertainty: f64,
+    pub degrees_of_freedom: f64,
+    pub coverage_factor_95: f64,
+    pub expanded_uncertainty_95: f64,
+}
+
+fn gum_k95() -> f64 { 1.96 }
+
+fn sim_gum_simple(value: f64, std_u: f64) -> GUMResult {
+    let u = sim_abs(std_u)
+    let k = gum_k95()
+    GUMResult {
+        value: value,
+        std_uncertainty: u,
+        degrees_of_freedom: 1.0e9,
+        coverage_factor_95: k,
+        expanded_uncertainty_95: k * u,
+    }
+}
+
+// ============================================================================
+// PBPK PARAMETER STRUCT
+// ============================================================================
+
+pub struct PBPKParams {
+    pub dose: f64,               // mg — administered dose
+    pub dose_unc: f64,           // mg — standard uncertainty on dose
+    pub ka: f64,                 // 1/h — absorption rate constant
+    pub ka_unc: f64,
+    pub ke: f64,                 // 1/h — elimination rate constant
+    pub ke_unc: f64,
+    pub vd: f64,                 // L — volume of distribution (central)
+    pub vd_unc: f64,
+    pub k12: f64,                // 1/h — central→peripheral transfer rate
+    pub k12_unc: f64,
+    pub k21: f64,                // 1/h — peripheral→central transfer rate
+    pub k21_unc: f64,
+    pub bioavailability: f64,    // F — oral bioavailability [0,1]
+    pub bioavailability_unc: f64,
+}
+
+// ============================================================================
+// PBPK STATE STRUCT
+// ============================================================================
+
+pub struct PBPKState {
+    pub gut: f64,
+    pub central: f64,
+    pub peripheral: f64,
+    pub eliminated: f64,
+    pub gut_unc: f64,
+    pub central_unc: f64,
+    pub peripheral_unc: f64,
+    pub eliminated_unc: f64,
+    pub time: f64,
+}
+
+// ============================================================================
+// PBPK RESULT STRUCT
+// ============================================================================
+
+pub struct PBPKResult {
+    pub cmax: GUMResult,
+    pub tmax: f64,
+    pub auc: GUMResult,
+    pub half_life: GUMResult,
+    pub clearance: GUMResult,
+    pub final_state: PBPKState,
+    pub time_points: [f64; 256],
+    pub concentrations: [f64; 256],
+    pub conc_uncertainties: [f64; 256],
+    pub n_points: i32,
+}
+
+// ============================================================================
+// DEFAULT PARAMETERS — Typical small-molecule oral drug
+// dose=100mg±5, ka=1.0±0.1/h, ke=0.1±0.01/h, Vd=50L±5
+// k12=0.3±0.03/h, k21=0.2±0.02/h, F=0.8±0.05
+// ============================================================================
+
+pub fn pbpk_params_default() -> PBPKParams {
+    PBPKParams {
+        dose: 100.0,
+        dose_unc: 5.0,
+        ka: 1.0,
+        ka_unc: 0.1,
+        ke: 0.1,
+        ke_unc: 0.01,
+        vd: 50.0,
+        vd_unc: 5.0,
+        k12: 0.3,
+        k12_unc: 0.03,
+        k21: 0.2,
+        k21_unc: 0.02,
+        bioavailability: 0.8,
+        bioavailability_unc: 0.05,
+    }
+}
+
+// ============================================================================
+// INITIAL STATE — dose * F in gut, rest zero
+// u(gut₀)² = (F * u_dose)² + (dose * u_F)²
+// ============================================================================
+
+pub fn pbpk_state_initial(params: &PBPKParams) -> PBPKState {
+    let gut0 = params.dose * params.bioavailability
+    let u_gut0 = sim_sqrt(
+        params.bioavailability * params.bioavailability * params.dose_unc * params.dose_unc
+      + params.dose * params.dose * params.bioavailability_unc * params.bioavailability_unc
+    )
+    PBPKState {
+        gut: gut0,
+        central: 0.0,
+        peripheral: 0.0,
+        eliminated: 0.0,
+        gut_unc: u_gut0,
+        central_unc: 0.0,
+        peripheral_unc: 0.0,
+        eliminated_unc: 0.0,
+        time: 0.0,
+    }
+}
+
+// ============================================================================
+// DERIVATIVE HELPERS — each compartment value + GUM uncertainty
+// ============================================================================
+
+fn dgut_val(gut: f64, ka: f64) -> f64 {
+    return 0.0 - ka * gut
+}
+
+fn dgut_unc(gut: f64, gut_unc: f64, ka: f64, ka_unc: f64) -> f64 {
+    let t1 = ka * gut_unc
+    let t2 = gut * ka_unc
+    return sim_sqrt(t1 * t1 + t2 * t2)
+}
+
+fn dcentral_val(gut: f64, central: f64, peripheral: f64,
+                ka: f64, ke: f64, k12: f64, k21: f64) -> f64 {
+    return ka * gut - (ke + k12) * central + k21 * peripheral
+}
+
+fn dcentral_unc(gut: f64, gut_unc: f64, central: f64, central_unc: f64,
+                peripheral: f64, peripheral_unc: f64,
+                ka: f64, ka_unc: f64, ke: f64, ke_unc: f64,
+                k12: f64, k12_unc: f64, k21: f64, k21_unc: f64) -> f64 {
+    let u_kag = sim_sqrt((ka * gut_unc) * (ka * gut_unc) + (gut * ka_unc) * (gut * ka_unc))
+    let kk = ke + k12
+    let u_kkc = sim_sqrt(
+        (central * ke_unc) * (central * ke_unc)
+      + (central * k12_unc) * (central * k12_unc)
+      + (kk * central_unc) * (kk * central_unc)
+    )
+    let u_k21p = sim_sqrt(
+        (k21 * peripheral_unc) * (k21 * peripheral_unc)
+      + (peripheral * k21_unc) * (peripheral * k21_unc)
+    )
+    return sim_sqrt(u_kag * u_kag + u_kkc * u_kkc + u_k21p * u_k21p)
+}
+
+fn dperipheral_val(central: f64, peripheral: f64, k12: f64, k21: f64) -> f64 {
+    return k12 * central - k21 * peripheral
+}
+
+fn dperipheral_unc(central: f64, central_unc: f64, peripheral: f64, peripheral_unc: f64,
+                   k12: f64, k12_unc: f64, k21: f64, k21_unc: f64) -> f64 {
+    let u_k12c = sim_sqrt(
+        (k12 * central_unc) * (k12 * central_unc)
+      + (central * k12_unc) * (central * k12_unc)
+    )
+    let u_k21p = sim_sqrt(
+        (k21 * peripheral_unc) * (k21 * peripheral_unc)
+      + (peripheral * k21_unc) * (peripheral * k21_unc)
+    )
+    return sim_sqrt(u_k12c * u_k12c + u_k21p * u_k21p)
+}
+
+fn delim_val(central: f64, ke: f64) -> f64 {
+    return ke * central
+}
+
+fn delim_unc(central: f64, central_unc: f64, ke: f64, ke_unc: f64) -> f64 {
+    let t1 = ke * central_unc
+    let t2 = central * ke_unc
+    return sim_sqrt(t1 * t1 + t2 * t2)
+}
+
+// Build derivative state at the given state/params
+fn deriv_at(st: PBPKState, params: &PBPKParams) -> PBPKState {
+    let dg = dgut_val(st.gut, params.ka)
+    let dc = dcentral_val(st.gut, st.central, st.peripheral,
+                           params.ka, params.ke, params.k12, params.k21)
+    let dp = dperipheral_val(st.central, st.peripheral, params.k12, params.k21)
+    let de = delim_val(st.central, params.ke)
+
+    let ug = dgut_unc(st.gut, st.gut_unc, params.ka, params.ka_unc)
+    let uc = dcentral_unc(
+        st.gut, st.gut_unc, st.central, st.central_unc,
+        st.peripheral, st.peripheral_unc,
+        params.ka, params.ka_unc, params.ke, params.ke_unc,
+        params.k12, params.k12_unc, params.k21, params.k21_unc
+    )
+    let up = dperipheral_unc(
+        st.central, st.central_unc, st.peripheral, st.peripheral_unc,
+        params.k12, params.k12_unc, params.k21, params.k21_unc
+    )
+    let ue = delim_unc(st.central, st.central_unc, params.ke, params.ke_unc)
+
+    PBPKState {
+        gut: dg, central: dc, peripheral: dp, eliminated: de,
+        gut_unc: ug, central_unc: uc, peripheral_unc: up, eliminated_unc: ue,
+        time: 0.0,
+    }
+}
+
+// ============================================================================
+// RK4 STEP WITH GUM UNCERTAINTY PROPAGATION
+//
+// State: y_{n+1} = y_n + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+//
+// Uncertainty: u(y_{n+1})² ≈ u(y_n)² + (dt/6)² * (u_k1² + 4*u_k2² + 4*u_k3² + u_k4²)
+// (uncorrelated derivative uncertainties — standard GUM assumption)
+// ============================================================================
+
+fn rk4_step_pbpk(st: PBPKState, dt: f64, params: &PBPKParams) -> PBPKState with Div, Panic {
+    let k1 = deriv_at(st, params)
+
+    let h = dt * 0.5
+    let st2 = PBPKState {
+        gut:            st.gut            + h * k1.gut,
+        central:        st.central        + h * k1.central,
+        peripheral:     st.peripheral     + h * k1.peripheral,
+        eliminated:     st.eliminated     + h * k1.eliminated,
+        gut_unc:        st.gut_unc,
+        central_unc:    st.central_unc,
+        peripheral_unc: st.peripheral_unc,
+        eliminated_unc: st.eliminated_unc,
+        time:           st.time + h,
+    }
+    let k2 = deriv_at(st2, params)
+
+    let st3 = PBPKState {
+        gut:            st.gut            + h * k2.gut,
+        central:        st.central        + h * k2.central,
+        peripheral:     st.peripheral     + h * k2.peripheral,
+        eliminated:     st.eliminated     + h * k2.eliminated,
+        gut_unc:        st.gut_unc,
+        central_unc:    st.central_unc,
+        peripheral_unc: st.peripheral_unc,
+        eliminated_unc: st.eliminated_unc,
+        time:           st.time + h,
+    }
+    let k3 = deriv_at(st3, params)
+
+    let st4 = PBPKState {
+        gut:            st.gut            + dt * k3.gut,
+        central:        st.central        + dt * k3.central,
+        peripheral:     st.peripheral     + dt * k3.peripheral,
+        eliminated:     st.eliminated     + dt * k3.eliminated,
+        gut_unc:        st.gut_unc,
+        central_unc:    st.central_unc,
+        peripheral_unc: st.peripheral_unc,
+        eliminated_unc: st.eliminated_unc,
+        time:           st.time + dt,
+    }
+    let k4 = deriv_at(st4, params)
+
+    let sixth = dt / 6.0
+    let s2    = sixth * sixth
+
+    let gut_new        = st.gut        + sixth * (k1.gut        + 2.0 * k2.gut        + 2.0 * k3.gut        + k4.gut)
+    let central_new    = st.central    + sixth * (k1.central    + 2.0 * k2.central    + 2.0 * k3.central    + k4.central)
+    let peripheral_new = st.peripheral + sixth * (k1.peripheral + 2.0 * k2.peripheral + 2.0 * k3.peripheral + k4.peripheral)
+    let eliminated_new = st.eliminated + sixth * (k1.eliminated + 2.0 * k2.eliminated + 2.0 * k3.eliminated + k4.eliminated)
+
+    let gut_uvar = st.gut_unc * st.gut_unc + s2 * (
+        k1.gut_unc * k1.gut_unc + 4.0 * k2.gut_unc * k2.gut_unc
+      + 4.0 * k3.gut_unc * k3.gut_unc + k4.gut_unc * k4.gut_unc
+    )
+    let central_uvar = st.central_unc * st.central_unc + s2 * (
+        k1.central_unc * k1.central_unc + 4.0 * k2.central_unc * k2.central_unc
+      + 4.0 * k3.central_unc * k3.central_unc + k4.central_unc * k4.central_unc
+    )
+    let periph_uvar = st.peripheral_unc * st.peripheral_unc + s2 * (
+        k1.peripheral_unc * k1.peripheral_unc + 4.0 * k2.peripheral_unc * k2.peripheral_unc
+      + 4.0 * k3.peripheral_unc * k3.peripheral_unc + k4.peripheral_unc * k4.peripheral_unc
+    )
+    let elim_uvar = st.eliminated_unc * st.eliminated_unc + s2 * (
+        k1.eliminated_unc * k1.eliminated_unc + 4.0 * k2.eliminated_unc * k2.eliminated_unc
+      + 4.0 * k3.eliminated_unc * k3.eliminated_unc + k4.eliminated_unc * k4.eliminated_unc
+    )
+
+    PBPKState {
+        gut:            gut_new,
+        central:        central_new,
+        peripheral:     peripheral_new,
+        eliminated:     eliminated_new,
+        gut_unc:        sim_sqrt(gut_uvar),
+        central_unc:    sim_sqrt(central_uvar),
+        peripheral_unc: sim_sqrt(periph_uvar),
+        eliminated_unc: sim_sqrt(elim_uvar),
+        time:           st.time + dt,
+    }
+}
+
+// ============================================================================
+// MAIN SIMULATION FUNCTION
+// ============================================================================
+
+pub fn pbpk_simulate(params: &PBPKParams, t_end: f64, n_steps: i32) -> PBPKResult with Mut, Div, Panic {
+    let max_pts = 256
+    let steps = if n_steps > max_pts { max_pts } else { n_steps }
+    let steps_f = steps as f64
+    let dt = t_end / steps_f
+
+    var st = pbpk_state_initial(params)
+    let vd = params.vd
+
+    var time_pts: [f64; 256] = [0.0; 256]
+    var conc_pts: [f64; 256] = [0.0; 256]
+    var unc_pts:  [f64; 256] = [0.0; 256]
+
+    // t=0: concentration = central/Vd = 0 (all drug in gut initially)
+    let conc0 = 0.0
+    let unc0  = 0.0
+    time_pts[0] = 0.0
+    conc_pts[0] = conc0
+    unc_pts[0]  = unc0
+
+    var cmax     = conc0
+    var cmax_unc = unc0
+    var tmax     = 0.0
+    var auc      = 0.0
+    var auc_var  = 0.0
+    var prev_c   = conc0
+    var prev_u   = unc0
+
+    var i = 1
+    while i <= steps {
+        st = rk4_step_pbpk(st, dt, params)
+
+        let conc = st.central / vd
+        // u(C) = u(central/Vd): GUM division by uncertain Vd
+        let u_conc = sim_sqrt(
+            (st.central_unc / vd) * (st.central_unc / vd)
+          + (st.central * params.vd_unc / (vd * vd)) * (st.central * params.vd_unc / (vd * vd))
+        )
+
+        if i < max_pts {
+            time_pts[i] = st.time
+            conc_pts[i] = conc
+            unc_pts[i]  = u_conc
+        }
+
+        if conc > cmax {
+            cmax     = conc
+            cmax_unc = u_conc
+            tmax     = st.time
+        }
+
+        // Trapezoidal AUC
+        let trap = (prev_c + conc) * 0.5 * dt
+        let trap_var = (dt * 0.5) * (dt * 0.5) * (prev_u * prev_u + u_conc * u_conc)
+        auc     = auc     + trap
+        auc_var = auc_var + trap_var
+
+        prev_c = conc
+        prev_u = u_conc
+        i = i + 1
+    }
+
+    let auc_result  = sim_gum_simple(auc, sim_sqrt(auc_var))
+    let cmax_result = sim_gum_simple(cmax, cmax_unc)
+
+    // Half-life = ln(2)/ke; u(t½) = ln(2) * u_ke / ke²
+    let ke    = params.ke
+    let hl    = ln2() / ke
+    let hl_u  = ln2() * params.ke_unc / (ke * ke)
+    let hl_result = sim_gum_simple(hl, hl_u)
+
+    // Clearance = dose*F / AUC
+    let dose_f   = params.dose * params.bioavailability
+    let u_dose_f = sim_sqrt(
+        (params.bioavailability * params.dose_unc) * (params.bioavailability * params.dose_unc)
+      + (params.dose * params.bioavailability_unc) * (params.dose * params.bioavailability_unc)
+    )
+    let cl_result = if auc > 1.0e-15 {
+        let cl_val = dose_f / auc
+        let cl_unc = sim_sqrt(
+            (u_dose_f / auc) * (u_dose_f / auc)
+          + (dose_f * sim_sqrt(auc_var) / (auc * auc)) * (dose_f * sim_sqrt(auc_var) / (auc * auc))
+        )
+        sim_gum_simple(cl_val, cl_unc)
+    } else {
+        sim_gum_simple(0.0, 0.0)
+    }
+
+    let n_pts = if steps + 1 < max_pts { steps + 1 } else { max_pts }
+
+    PBPKResult {
+        cmax: cmax_result,
+        tmax: tmax,
+        auc: auc_result,
+        half_life: hl_result,
+        clearance: cl_result,
+        final_state: st,
+        time_points: time_pts,
+        concentrations: conc_pts,
+        conc_uncertainties: unc_pts,
+        n_points: n_pts,
+    }
+}
+
+// ============================================================================
+// THERAPEUTIC WINDOW ANALYSIS
+//
+// effective_conc_low  = conc - 1.96 * u_conc  (lower 95% CI bound)
+// effective_conc_high = conc + 1.96 * u_conc  (upper 95% CI bound)
+//
+// time_above_mec: duration where lower bound > mec (drug certainly therapeutic)
+// time_below_mtc: duration where upper bound < mtc (drug certainly safe)
+// ============================================================================
+
+pub fn pbpk_therapeutic_window(result: &PBPKResult, mec: f64, mtc: f64) -> (f64, f64) with Mut, Div, Panic {
+    let n = result.n_points
+    if n < 2 {
+        return (0.0, 0.0)
+    }
+
+    var time_above_mec = 0.0
+    var time_below_mtc = 0.0
+
+    var idx = 1
+    while idx < n {
+        let t0 = result.time_points[idx - 1]
+        let t1 = result.time_points[idx]
+        let dt_seg = t1 - t0
+        if dt_seg < 1.0e-15 {
+            idx = idx + 1
+            continue
+        }
+
+        let c0    = result.concentrations[idx - 1]
+        let u0    = result.conc_uncertainties[idx - 1]
+        let c1    = result.concentrations[idx]
+        let u1    = result.conc_uncertainties[idx]
+        let c_mid = (c0 + c1) * 0.5
+        let u_mid = (u0 + u1) * 0.5
+
+        let c_low  = c_mid - 1.96 * u_mid
+        let c_high = c_mid + 1.96 * u_mid
+
+        if c_low > mec {
+            time_above_mec = time_above_mec + dt_seg
+        }
+        if c_high < mtc {
+            time_below_mtc = time_below_mtc + dt_seg
+        }
+
+        idx = idx + 1
+    }
+
+    return (time_above_mec, time_below_mtc)
+}

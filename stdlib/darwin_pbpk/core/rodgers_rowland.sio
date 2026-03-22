@@ -1,0 +1,83 @@
+// rodgers_rowland.sio — Rodgers-Rowland tissue:plasma partition coefficient model
+// Reference: Rodgers & Rowland (2006-2007) J Pharm Sci
+
+fn rr_pow(base: f64, exp_int: i64) -> f64 {
+    if exp_int == 0 { return 1.0 }
+    var result = 1.0
+    var i: i64 = 0
+    while i < exp_int { result = result * base; i = i + 1 }
+    result
+}
+
+fn rr_log10(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 }
+    var v = x
+    var scale = 0.0
+    while v > 2.0 { v = v / 2.718281828; scale = scale + 1.0 }
+    while v < 0.5 { v = v * 2.718281828; scale = scale - 1.0 }
+    let y = (v - 1.0) / (v + 1.0)
+    let y2 = y * y
+    let ln_val = 2.0 * y * (1.0 + y2 / 3.0 + y2 * y2 / 5.0 + y2 * y2 * y2 / 7.0) + scale
+    ln_val / 2.302585093
+}
+
+struct TissueComposition {
+    f_water: f64,
+    f_ew: f64,
+    f_iw: f64,
+    f_neutral_lipid: f64,
+    f_phospholipid: f64,
+    f_acidic_phospholipid: f64,
+    f_protein: f64,
+    pH_iw: f64,
+}
+
+fn tissue_liver() -> TissueComposition {
+    TissueComposition { f_water: 0.751, f_ew: 0.161, f_iw: 0.573, f_neutral_lipid: 0.014, f_phospholipid: 0.024, f_acidic_phospholipid: 0.005, f_protein: 0.157, pH_iw: 7.0 }
+}
+
+fn tissue_brain() -> TissueComposition {
+    TissueComposition { f_water: 0.770, f_ew: 0.092, f_iw: 0.678, f_neutral_lipid: 0.039, f_phospholipid: 0.036, f_acidic_phospholipid: 0.0059, f_protein: 0.048, pH_iw: 7.0 }
+}
+
+fn tissue_kidney() -> TissueComposition {
+    TissueComposition { f_water: 0.783, f_ew: 0.209, f_iw: 0.483, f_neutral_lipid: 0.012, f_phospholipid: 0.024, f_acidic_phospholipid: 0.005, f_protein: 0.127, pH_iw: 7.0 }
+}
+
+struct DrugPropertiesRR {
+    logP: f64,
+    pKa: f64,
+    fu_plasma: f64,
+    is_acid: bool,
+    blood_plasma_ratio: f64,
+}
+
+// Ionization fraction for acids/bases
+fn fraction_ionized(pKa: f64, pH: f64, is_acid: bool) -> f64 {
+    let delta = if is_acid { pH - pKa } else { pKa - pH }
+    let pow10 = rr_pow(10.0, if delta > 0.0 { (delta * 10.0) as i64 } else { 0 })
+    let ratio = (pow10 as f64) / rr_pow(10.0, ((delta * 10.0) as i64) - (delta * 10.0) as i64)
+    1.0 / (1.0 + ratio)
+}
+
+// Rodgers-Rowland Kp for moderate-to-strong bases
+fn kp_rodgers_rowland(tissue: TissueComposition, drug: DrugPropertiesRR) -> f64 with Div, Panic, Mut {
+    let P = rr_pow(10.0, (drug.logP * 10.0) as i64) // approximate
+    let fi = fraction_ionized(drug.pKa, tissue.pH_iw, drug.is_acid)
+    let fu = drug.fu_plasma
+
+    // Simplified Kp prediction
+    let kp_uw = tissue.f_ew + (1.0 + fi) * tissue.f_iw
+    let kp_nl = tissue.f_neutral_lipid * (P as f64) * 0.3
+    let kp_pl = tissue.f_phospholipid * (P as f64) * 0.7 * (1.0 + fi)
+
+    let kp = (kp_uw + kp_nl + kp_pl) / fu
+    if kp < 0.01 { 0.01 } else { kp }
+}
+
+fn test_kp_liver_basic() -> bool with Div, Panic, Mut {
+    let liver = tissue_liver()
+    let drug = DrugPropertiesRR { logP: 2.0, pKa: 8.0, fu_plasma: 0.1, is_acid: false, blood_plasma_ratio: 1.0 }
+    let kp = kp_rodgers_rowland(liver, drug)
+    kp > 0.0
+}

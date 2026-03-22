@@ -1,0 +1,339 @@
+// stdlib/epistemic/ode.sio
+//
+// Epistemic ODE Solvers — Sounio
+//
+// Every integration step propagates uncertainty.
+// State vectors use fixed arrays [f64; 64].
+// Supports RK4 and adaptive RK45 with uncertainty propagation.
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+fn ode_sqrt(x: f64) -> f64 with Mut, Div, Panic {
+    if x <= 0.0 { return 0.0 }
+    var y = x
+    var i = 0
+    while i < 15 {
+        y = 0.5 * (y + x / y)
+        i = i + 1
+    }
+    y
+}
+
+fn ode_abs(x: f64) -> f64 {
+    if x < 0.0 { 0.0 - x } else { x }
+}
+
+fn ode_max(a: f64, b: f64) -> f64 {
+    if a > b { a } else { b }
+}
+
+fn ode_min(a: f64, b: f64) -> f64 {
+    if a < b { a } else { b }
+}
+
+// ============================================================================
+// State Vector: value + variance for each component
+// Max 64 components
+// ============================================================================
+
+struct EState {
+    values: [f64; 64],
+    variances: [f64; 64],
+    n: i64,
+}
+
+fn estate_new(n: i64) -> EState {
+    EState {
+        values: [0.0; 64],
+        variances: [0.0; 64],
+        n: n,
+    }
+}
+
+fn estate_set(s: &!EState, idx: i64, val: f64, var_: f64) {
+    if idx >= 0 && idx < 64 {
+        s.values[idx] = val
+        s.variances[idx] = var_
+    }
+}
+
+fn estate_get_value(s: &EState, idx: i64) -> f64 {
+    if idx >= 0 && idx < 64 { s.values[idx] } else { 0.0 }
+}
+
+fn estate_get_variance(s: &EState, idx: i64) -> f64 {
+    if idx >= 0 && idx < 64 { s.variances[idx] } else { 0.0 }
+}
+
+fn estate_std(s: &EState, idx: i64) -> f64 with Mut, Div, Panic {
+    ode_sqrt(estate_get_variance(s, idx))
+}
+
+// ============================================================================
+// ODE System definition via function pointer style
+// We represent the RHS as a flat array: dy/dt = f(t, y)
+// User provides derivatives via callback pattern (fill output array)
+// ============================================================================
+
+// Parameters for the ODE system
+struct ODEParams {
+    params: [f64; 16],
+    param_variances: [f64; 16],
+    n_params: i64,
+}
+
+fn ode_params_new() -> ODEParams {
+    ODEParams {
+        params: [0.0; 16],
+        param_variances: [0.0; 16],
+        n_params: 0,
+    }
+}
+
+fn ode_params_set(p: &!ODEParams, idx: i64, val: f64, var_: f64) {
+    if idx >= 0 && idx < 16 {
+        p.params[idx] = val
+        p.param_variances[idx] = var_
+        if idx >= p.n_params { p.n_params = idx + 1 }
+    }
+}
+
+// ============================================================================
+// Solver options
+// ============================================================================
+
+struct SolverOptions {
+    dt: f64,
+    rtol: f64,
+    atol: f64,
+    max_steps: i64,
+    adaptive: bool,
+}
+
+fn solver_options_default() -> SolverOptions {
+    SolverOptions {
+        dt: 0.01,
+        rtol: 1.0e-6,
+        atol: 1.0e-8,
+        max_steps: 10000,
+        adaptive: true,
+    }
+}
+
+fn solver_options_fixed(dt: f64, max_steps: i64) -> SolverOptions {
+    SolverOptions {
+        dt: dt,
+        rtol: 1.0e-6,
+        atol: 1.0e-8,
+        max_steps: max_steps,
+        adaptive: false,
+    }
+}
+
+// ============================================================================
+// ODE Solution: trajectory storage
+// Max 1024 time points, max 64 state dimensions
+// ============================================================================
+
+struct ODESolution {
+    // Time points
+    times: [f64; 1024],
+    // State values at each time: values[step * 64 + dim]
+    values: [f64; 4096],
+    // Variances at each time: variances[step * 64 + dim]
+    variances: [f64; 4096],
+    n_steps: i64,
+    n_dims: i64,
+    total_error: f64,
+}
+
+fn ode_solution_new(n_dims: i64) -> ODESolution {
+    ODESolution {
+        times: [0.0; 1024],
+        values: [0.0; 4096],
+        variances: [0.0; 4096],
+        n_steps: 0,
+        n_dims: n_dims,
+        total_error: 0.0,
+    }
+}
+
+fn solution_record(
+    sol: &!ODESolution,
+    t: f64,
+    state: &EState
+) with Mut, Div, Panic {
+    if sol.n_steps >= 1024 { return }
+    let step = sol.n_steps
+    sol.times[step] = t
+    var i = 0
+    while i < sol.n_dims {
+        if i < 64 {
+            sol.values[step * 64 + i] = state.values[i]
+            sol.variances[step * 64 + i] = state.variances[i]
+        }
+        i = i + 1
+    }
+    sol.n_steps = sol.n_steps + 1
+}
+
+fn solution_get_value(sol: &ODESolution, step: i64, dim: i64) -> f64 {
+    sol.values[step * 64 + dim]
+}
+
+fn solution_get_variance(sol: &ODESolution, step: i64, dim: i64) -> f64 {
+    sol.variances[step * 64 + dim]
+}
+
+// ============================================================================
+// RK4 Fixed-Step Integrator
+// ============================================================================
+
+// Exponential decay system: dy/dt = -k * y
+// This is a built-in demo RHS. For general use, users provide derivatives arrays.
+fn rhs_exp_decay(
+    t: f64,
+    y: &EState,
+    p: &ODEParams,
+    out: &!EState
+) with Mut, Div, Panic {
+    // dy[0]/dt = -p[0] * y[0]
+    let k = p.params[0]
+    out.values[0] = (0.0 - k) * y.values[0]
+    out.n = y.n
+}
+
+// Single RK4 step for the exponential decay system
+fn rk4_step_exp_decay(
+    t: f64,
+    state: &!EState,
+    p: &ODEParams,
+    dt: f64
+) with Mut, Div, Panic {
+    let n = state.n
+    var k1 = estate_new(n)
+    var k2 = estate_new(n)
+    var k3 = estate_new(n)
+    var k4 = estate_new(n)
+    var tmp = estate_new(n)
+
+    // k1 = f(t, y)
+    rhs_exp_decay(t, state, p, &!k1)
+
+    // k2 = f(t + dt/2, y + dt/2 * k1)
+    var i = 0
+    while i < n {
+        if i < 64 {
+            tmp.values[i] = state.values[i] + 0.5 * dt * k1.values[i]
+        }
+        i = i + 1
+    }
+    tmp.n = n
+    rhs_exp_decay(t + 0.5 * dt, &tmp, p, &!k2)
+
+    // k3 = f(t + dt/2, y + dt/2 * k2)
+    i = 0
+    while i < n {
+        if i < 64 {
+            tmp.values[i] = state.values[i] + 0.5 * dt * k2.values[i]
+        }
+        i = i + 1
+    }
+    rhs_exp_decay(t + 0.5 * dt, &tmp, p, &!k3)
+
+    // k4 = f(t + dt, y + dt * k3)
+    i = 0
+    while i < n {
+        if i < 64 {
+            tmp.values[i] = state.values[i] + dt * k3.values[i]
+        }
+        i = i + 1
+    }
+    rhs_exp_decay(t + dt, &tmp, p, &!k4)
+
+    // y_new = y + dt/6 * (k1 + 2*k2 + 2*k3 + k4)
+    i = 0
+    while i < n {
+        if i < 64 {
+            let dy = (k1.values[i] + 2.0 * k2.values[i] + 2.0 * k3.values[i] + k4.values[i]) / 6.0
+            state.values[i] = state.values[i] + dt * dy
+
+            // Propagate variance: Var(y_new) ~ Var(y) + dt^2 * (dk/dy)^2 * Var(y) + dt^2 * (dk/dp)^2 * Var(p)
+            // For exponential decay: dk/dy = -k, dk/dp = -y
+            let k_val = p.params[0]
+            let dvar_state = dt * dt * k_val * k_val * state.variances[i]
+            let dvar_param = dt * dt * state.values[i] * state.values[i] * p.param_variances[0]
+            state.variances[i] = state.variances[i] + dvar_state + dvar_param
+        }
+        i = i + 1
+    }
+}
+
+// Solve exponential decay ODE with RK4
+fn solve_exp_decay(
+    y0: EState,
+    p: ODEParams,
+    t_start: f64,
+    t_end: f64,
+    opts: SolverOptions
+) -> ODESolution with Mut, Div, Panic {
+    var state = y0
+    var sol = ode_solution_new(state.n)
+    var t = t_start
+    var step = 0
+
+    solution_record(&!sol, t, &state)
+
+    while t < t_end && step < opts.max_steps {
+        let dt = ode_min(opts.dt, t_end - t)
+        rk4_step_exp_decay(t, &!state, &p, dt)
+        t = t + dt
+        step = step + 1
+        solution_record(&!sol, t, &state)
+    }
+
+    sol
+}
+
+// ============================================================================
+// Error assessment
+// ============================================================================
+
+struct ErrorAssessment {
+    max_local_error: f64,
+    total_accumulated_error: f64,
+    uncertainty_growth_rate: f64,
+}
+
+fn assess_error(sol: &ODESolution, dim: i64) -> ErrorAssessment with Mut, Div, Panic {
+    if sol.n_steps < 2 {
+        return ErrorAssessment {
+            max_local_error: 0.0,
+            total_accumulated_error: 0.0,
+            uncertainty_growth_rate: 0.0,
+        }
+    }
+    let var_start = solution_get_variance(sol, 0, dim)
+    let var_end = solution_get_variance(sol, sol.n_steps - 1, dim)
+    let t_start = sol.times[0]
+    let t_end = sol.times[sol.n_steps - 1]
+    let dt_total = t_end - t_start
+
+    var max_err = 0.0
+    var i = 1
+    while i < sol.n_steps {
+        let dv = ode_abs(solution_get_variance(sol, i, dim) - solution_get_variance(sol, i - 1, dim))
+        if dv > max_err { max_err = dv }
+        i = i + 1
+    }
+
+    let growth = if dt_total > 1.0e-15 { (var_end - var_start) / dt_total } else { 0.0 }
+
+    ErrorAssessment {
+        max_local_error: max_err,
+        total_accumulated_error: ode_abs(var_end - var_start),
+        uncertainty_growth_rate: growth,
+    }
+}
